@@ -105,11 +105,22 @@ Pins are set in the `substitutions:` block at the top of the YAML.
 - **Reversing valve:** RV energized means Cooling, regardless of the B/O DIP
   switch. This matches upstream's logic and the AID tool on the reference unit.
 
+## Wi-Fi power save is turned off (important)
+
+The YAML sets `power_save_mode: none` under `wifi:`. **Keep it.** With the
+ESP32's default light power-save, traffic *to* the device (your hub's
+keepalive pings and API requests) can be delayed or dropped for seconds to
+minutes while traffic *from* it keeps flowing. The device never reboots or
+loses Wi-Fi, but the hub sees pings go unanswered and repeatedly marks it
+offline. Signal strength doesn't matter: it happened at a strong -48 dBm on the
+reference install, and turning power save off stopped it completely. The
+monitor is mains-powered, so the extra power draw doesn't matter.
+
 ## Reporting cadence (why the filters are there)
 
 `modbus_controller` re-publishes every entity on every poll, even when nothing
-changed. That came to about 20 API pushes a minute, which is enough to bog down
-a Hubitat hub's ESPHome connection. Each numeric sensor therefore uses:
+changed. That came to about 20 API pushes a minute, far more than a monitor
+needs. Each numeric sensor therefore uses:
 
 ```yaml
 filters:
