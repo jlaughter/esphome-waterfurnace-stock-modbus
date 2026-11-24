@@ -16,6 +16,27 @@ Assistant, Hubitat, or anything else that speaks the ESPHome native API.
 | Your ABC board answers WaterFurnace's proprietary function codes 0x41/0x42 and you want everything (control, thermostat zones, refrigeration detail, DHW) | The full upstream component: [espforge/esphome-waterfurnace](https://github.com/espforge/esphome-waterfurnace) or [daemonp/esphome_waterfurnace_aurora](https://github.com/daemonp/esphome_waterfurnace_aurora) |
 | You only want monitoring and alerting and would rather not depend on proprietary function codes | Either one works. This project is deliberately smaller |
 
+### Two variants in this repo
+
+| File | Needs | Notes |
+|---|---|---|
+| `waterfurnace-monitor.yaml` | Any ABC firmware | **Stock Modbus.** Only standard function codes; the original reason this repo exists |
+| `waterfurnace-monitor-upstream.yaml` | ABC firmware that answers 0x41/0x42 (e.g. v4.x) | **Upstream component**, kept read-only. Adds hardware auto-detection, COP, water delta-T, approach temp, heat of extraction/rejection, total watts, aux amps, fault history, model/serial. **Experimental**: under evaluation on the reference unit |
+
+Both variants use the same hardware, pins, OLED layout and Hubitat-friendly
+reporting filters, so you can swap between them by reflashing. The upstream
+variant declares the hub directly instead of importing upstream's package. That
+leaves out upstream's climate, water heater, switch, number, select and button
+platforms, all of which write to the board, so it stays strictly read-only.
+
+Upstream variant differences to be aware of:
+- There are no separate compressor **stage 1/2** entities. You get "Compressor
+  Running" plus a mode string with no stage number. Stage still shows
+  indirectly through blower ECM speed and compressor amps/watts.
+- Water thermistor swapping uses upstream's `water_temps_swapped: true`, which
+  also corrects the COP and approach math.
+- Pressure switches use upstream's polarity: *problem* means the switch is open.
+
 ### Why this exists
 
 The full components poll efficiently using WaterFurnace's proprietary function
