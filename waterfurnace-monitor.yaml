@@ -709,9 +709,11 @@ binary_sensor:
     address: 31
     bitmask: 0x80
     entity_category: diagnostic
-    # Polarity (1=tripped vs 1=normal) not yet verified against a known-good
-    # run on this install — watch this during normal operation once and
-    # confirm before relying on it for alerting.
+    # Status bit is SET when the switch is closed (normal) -- verified on the
+    # reference unit (both bits set while idle, no fault) and matches upstream
+    # ((status & STATUS_LPS) == 0 means problem). Invert so true = tripped.
+    filters:
+      - invert:
 
   - platform: modbus_controller
     modbus_controller_id: aurora
@@ -722,7 +724,9 @@ binary_sensor:
     address: 31
     bitmask: 0x100
     entity_category: diagnostic
-    # Same polarity caveat as the low pressure switch above.
+    # Same polarity as the low pressure switch above: invert so true = tripped.
+    filters:
+      - invert:
 
   - platform: modbus_controller
     modbus_controller_id: aurora

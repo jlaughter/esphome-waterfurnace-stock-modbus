@@ -27,9 +27,6 @@
 #     "Heating + Aux", "Emergency Heat", "Fan Only", "Waiting", "Standby",
 #     "Lockout"), with no stage number. Stage is still visible
 #     indirectly through blower ECM speed and compressor amps/watts.
-#   - Pressure switches use upstream's polarity: "problem" = switch OPEN
-#     (status bit clear). The stock variant reads the raw bit, which is the
-#     opposite polarity.
 #
 # STRICTLY READ-ONLY, BY CONSTRUCTION
 #   The upstream package also provides climate, water_heater, switch,
