@@ -1,0 +1,742 @@
+########################################################################
+# WaterFurnace Aurora Monitor: UPSTREAM COMPONENT variant
+# Repo: jlaughter/esphome-waterfurnace-stock-modbus
+#
+# Same hardware, pins, OLED and alerting as waterfurnace-monitor.yaml, but
+# built on the full upstream component (espforge/esphome-waterfurnace)
+# instead of stock modbus_controller. REQUIRES an ABC board that answers
+# WaterFurnace's proprietary function codes 0x41/0x42 (e.g. ABC v4.x). On
+# older firmware (v2.02 rejects 0x42) the component never finishes setup and
+# cycles Idle -> Link Down. Use waterfurnace-monitor.yaml there instead.
+#
+# WHAT YOU GAIN OVER THE STOCK-MODBUS VARIANT
+#   - Hardware auto-detection (AXB, VS drive, IZ2, blower type, pump type,
+#     energy monitor level): registers your hardware lacks are skipped
+#   - Derived efficiency metrics: COP, water delta-T, approach temperature,
+#     heat of extraction/rejection
+#   - Total system watts, aux amps, aux heat stage, anti-short-cycle timer
+#   - Fault history (last 10), model/serial number, hardware summary
+#   - Upstream-maintained register map and scaling, plus adaptive
+#     fast/medium/slow polling that batches reads with 0x42
+#   - Upstream only publishes a value when it changes, so there's no
+#     re-publish-every-poll chatter
+#
+# WHAT IS DIFFERENT / MISSING
+#   - No separate "Compressor Stage 1 / Stage 2" binary sensors. Upstream
+#     exposes "Compressor Running" plus a mode string ("Heating", "Cooling",
+#     "Heating + Aux", "Emergency Heat", "Fan Only", "Waiting", "Standby",
+#     "Lockout"), with no stage number. Stage is still visible
+#     indirectly through blower ECM speed and compressor amps/watts.
+#   - Pressure switches use upstream's polarity: "problem" = switch OPEN
+#     (status bit clear). The stock variant reads the raw bit, which is the
+#     opposite polarity.
+#
+# STRICTLY READ-ONLY, BY CONSTRUCTION
+#   The upstream package also provides climate, water_heater, switch,
+#   number, select and button platforms that WRITE to the ABC board. This
+#   file deliberately does NOT use the package; it declares the hub
+#   directly and only adds sensor / binary_sensor / text_sensor platforms.
+#   Nothing here can change a setting on the heat pump.
+#
+# HARDWARE WIRING (identical to the stock-Modbus variant)
+#   MAX485 <-> ESP32: RO->GPIO16 (RX2), DI->GPIO17 (TX2), DE+RE->GPIO4,
+#   VCC->3.3V (NOT 5V), GND->GND, A/B->AID port A/B.
+#   SSD1306 128x64 OLED (I2C): SDA->GPIO21, SCL->GPIO22.
+########################################################################
+
+substitutions:
+  name: "waterfurnace-monitor"
+  friendly_name: "WaterFurnace Monitor"
+
+  uart_tx_pin: "GPIO17"
+  uart_rx_pin: "GPIO16"
+  flow_control_pin: "GPIO4"
+  modbus_address: "1"
+
+  # Base (fast-tier) poll interval. Upstream defaults to 5s and polls slower
+  # tiers (setup-ish / slow-changing registers) at multiples of this. 15s is
+  # a polite middle ground for a monitor; RS-485 load is trivial either way.
+  update_interval: "15s"
+
+  # Pin to a tag or commit (e.g. ...@<sha>) once you have a known-good build,
+  # so an upstream change can't break your next compile.
+  component_source: "github://espforge/esphome-waterfurnace@main"
+
+  wifi_bar_4_rssi: "-50"
+  wifi_bar_3_rssi: "-60"
+  wifi_bar_2_rssi: "-70"
+  wifi_bar_1_rssi: "-80"
+
+  page_rotation_interval_s: "5"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.1.0   # upstream requirement
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Mains-powered: keep the radio awake. Light power-save let inbound
+  # packets (hub pings/API requests) be delayed or lost -> offline flaps.
+  power_save_mode: none
+  ap:
+    ssid: "${name}"
+
+web_server:
+  port: 80
+  local: true
+  version: "2"
+
+external_components:
+  - source: ${component_source}
+    components: [waterfurnace_aurora]
+
+########################################################################
+# RS-485 + upstream hub (no package import -- see READ-ONLY note above)
+########################################################################
+
+uart:
+  id: aurora_uart
+  tx_pin: ${uart_tx_pin}
+  rx_pin: ${uart_rx_pin}
+  baud_rate: 19200
+  parity: EVEN
+  stop_bits: 1
+
+waterfurnace_aurora:
+  id: aurora
+  uart_id: aurora_uart
+  address: ${modbus_address}
+  update_interval: ${update_interval}
+  flow_control_pin: ${flow_control_pin}
+  # This unit's entering/leaving water thermistors are on the physically
+  # opposite pipes from what the register names assume (confirmed during a
+  # cooling call -- see waterfurnace-monitor.yaml). Upstream's option fixes
+  # the labels AND the COP / approach-temperature math that depends on them.
+  water_temps_swapped: true
+  connected:
+    id: com_ok
+    name: "RS-485 Link"
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  frequency: 400kHz
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_main
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 10
+
+globals:
+  - id: page_rotation_index
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+switch:
+  # Local-only template switches (they control the OLED, not the heat pump)
+  - platform: template
+    id: show_diagnostics
+    name: "Show Signal Diagnostics"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: display_enabled
+    name: "Display Enabled"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - lambda: id(oled_display).turn_on();
+    on_turn_off:
+      - lambda: id(oled_display).turn_off();
+
+button:
+  # Restarts the ESP32 only; needed for the Hubitat driver's reboot() command
+  - platform: restart
+    name: "Restart"
+
+interval:
+  - interval: ${page_rotation_interval_s}s
+    then:
+      - lambda: |-
+          if (!id(com_ok).state || id(show_diagnostics).state) {
+            id(oled_display).show_page(id(page_diag));
+            id(oled_display).update();
+            return;
+          }
+          id(page_rotation_index) = (id(page_rotation_index) + 1) % 7;
+          switch (id(page_rotation_index)) {
+            case 0: id(oled_display).show_page(id(page_hvac)); break;
+            case 1: id(oled_display).show_page(id(page_fault)); break;
+            case 2: id(oled_display).show_page(id(page_air)); break;
+            case 3: id(oled_display).show_page(id(page_water)); break;
+            case 4: id(oled_display).show_page(id(page_energy1)); break;
+            case 5: id(oled_display).show_page(id(page_energy2)); break;
+            case 6: id(oled_display).show_page(id(page_efficiency)); break;
+          }
+          id(oled_display).update();
+
+########################################################################
+# Sensors
+#
+# REPORTING CADENCE: upstream already publishes only on change, but values
+# like water temps change by 0.1F most polls. Each numeric sensor therefore
+# uses the same or[throttle, delta] filter as the stock variant: a slow
+# heartbeat, plus immediate publish on a meaningful change. This keeps
+# Hubitat API traffic to a trickle. The OLED reads get_raw_state() (upstream
+# publishes values already scaled, so raw == real units) to stay live.
+########################################################################
+
+sensor:
+  - platform: uptime
+    id: device_uptime
+    name: "Uptime"
+    update_interval: 300s
+
+  - platform: wifi_signal
+    id: device_wifi_signal
+    name: "WiFi Signal"
+    update_interval: 300s
+
+  - platform: waterfurnace_aurora
+    aurora_id: aurora
+
+    # --- Faults ---
+    fault_code:
+      id: last_fault_code
+      name: "Last Fault Code"
+      filters:
+        - or:
+            - throttle: 3600s
+            - delta: 0.5
+    lockout_fault_code:
+      id: lockout_fault_code
+      name: "Last Lockout Event Code"
+      filters:
+        - or:
+            - throttle: 3600s
+            - delta: 0.5
+    anti_short_cycle:
+      id: anti_short_cycle
+      name: "Anti-Short-Cycle Remaining"
+      filters:
+        - or:
+            - throttle: 60s
+            - delta: 120.0
+            - lambda: 'if (x == 0) return x; return {};'   # reaching 0 always passes
+
+    # --- Air ---
+    entering_air_temperature:   # upstream picks reg 740 (AWL) or 567, suppresses 0
+      id: entering_air_temp
+      name: "Entering Air Temp"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+    axb_leaving_air_temperature:   # AXB reg 1112 -- no AWL needed (reg 900 does)
+      id: leaving_air_temp
+      name: "Leaving Air Temp"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+    blower_speed:   # ECM: actual speed 0-12 from reg 344
+      id: blower_ecm_speed
+      name: "Blower ECM Speed"
+      filters:
+        - or:
+            - throttle: 600s
+            - delta: 0.5
+
+    # --- Water / loop ---
+    entering_water_temperature:
+      id: entering_water_temp
+      name: "Entering Water Temp"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+    leaving_water_temperature:
+      id: leaving_water_temp
+      name: "Leaving Water Temp"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+    waterflow:
+      id: waterflow
+      name: "Water Flow"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+    water_delta_t:
+      id: water_delta_t
+      name: "Water Delta-T"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+    approach_temperature:
+      id: approach_temp
+      name: "Approach Temperature"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+
+    # --- Electrical ---
+    line_voltage:
+      id: line_voltage
+      name: "Line Voltage"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 5.0
+    compressor_1_amps:
+      id: compressor_1_amps
+      name: "Compressor 1 Current"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 1.0
+    compressor_2_amps:
+      id: compressor_2_amps
+      name: "Compressor 2 Current"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 1.0
+    blower_amps:
+      id: blower_amps
+      name: "Blower Current"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+    aux_amps:
+      id: aux_amps
+      name: "Aux Heat Current"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 2.0
+    aux_heat_stage:
+      id: aux_heat_stage
+      name: "Aux Heat Stage"
+      filters:
+        - or:
+            - throttle: 3600s
+            - delta: 0.5
+
+    # --- Power ---
+    total_watts:
+      id: total_watts
+      name: "Total Wattage"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 150.0
+    compressor_watts:
+      id: compressor_watts
+      name: "Compressor Wattage"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 100.0
+    blower_watts:
+      id: blower_watts
+      name: "Blower Wattage"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 50.0
+    aux_heat_watts:
+      id: aux_watts
+      name: "Aux Wattage"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 500.0
+    pump_watts:
+      id: open_loop_watts
+      name: "Open Loop Wattage"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 100.0
+
+    # --- Efficiency (new with the upstream component) ---
+    cop:
+      id: cop
+      name: "COP"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 0.2
+    heat_of_extraction:
+      id: heat_of_extraction
+      name: "Heat of Extraction"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 1000.0
+    heat_of_rejection:
+      id: heat_of_rejection
+      name: "Heat of Rejection"
+      filters:
+        - or:
+            - throttle: 300s
+            - delta: 1000.0
+
+########################################################################
+# Binary sensors: upstream publishes these only on change (no filters needed)
+########################################################################
+
+binary_sensor:
+  - platform: waterfurnace_aurora
+    aurora_id: aurora
+    locked_out:
+      id: locked_out
+      name: "System Locked Out"
+      device_class: problem
+    compressor_running:
+      id: compressor_running
+      name: "Compressor Running"
+    blower_running:
+      id: blower_on
+      name: "Blower Running"
+    aux_heat_running:
+      id: aux_heat_on
+      name: "Aux Heat Running"
+    low_pressure_switch:
+      name: "Low Pressure Switch"
+      device_class: problem
+      entity_category: diagnostic
+    high_pressure_switch:
+      name: "High Pressure Switch"
+      device_class: problem
+      entity_category: diagnostic
+    emergency_shutdown:
+      name: "Emergency Shutdown"
+      device_class: problem
+    load_shed:
+      name: "Load Shed"
+      entity_category: diagnostic
+
+########################################################################
+# Text sensors: upstream publishes these only on change
+########################################################################
+
+text_sensor:
+  - platform: waterfurnace_aurora
+    aurora_id: aurora
+    current_mode:
+      id: current_mode
+      name: "Current Mode"
+    fault_description:
+      id: fault_description
+      name: "Last Fault Description"
+    lockout_fault_description:
+      name: "Last Lockout Event Description"
+    fault_history:
+      name: "Fault History"
+    model_number:
+      name: "Model Number"
+    serial_number:
+      name: "Serial Number"
+    hardware_config:
+      name: "Hardware Config"
+    pump_type:
+      name: "Pump Type"
+
+########################################################################
+# Display: 128x64 SSD1306, yellow top 16px = status header, blue bottom
+# 48px = page body. Seven pages in rotation (the stock variant's six plus an
+# Efficiency page); page_diag takes over on link-down or via the switch.
+########################################################################
+
+display:
+  - platform: ssd1306_i2c
+    id: oled_display
+    model: "SSD1306 128x64"
+    address: 0x3C
+    update_interval: 1s
+    pages:
+      - id: page_hvac
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) status_text = "LINK DOWN";
+          else if (id(locked_out).state) status_text = "LOCK";
+          else status_text = id(current_mode).state;
+          it.print(0, 0, id(font_small), status_text.c_str());
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 : (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            else it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+            it.print(0, 46, id(font_small), "waiting for link...");
+          } else {
+            it.printf(0, 18, id(font_main), "%s", id(current_mode).state.c_str());
+            std::string blower_txt;
+            if (id(blower_on).state) {
+              float ecm = id(blower_ecm_speed).get_raw_state();
+              blower_txt = std::isnan(ecm) ? "Blower: ON"
+                         : "Blower: ON (ECM " + std::to_string((int) ecm) + ")";
+            } else {
+              blower_txt = "Blower: OFF";
+            }
+            it.print(0, 40, id(font_small), blower_txt.c_str());
+            float stage = id(aux_heat_stage).get_raw_state();
+            if (id(aux_heat_on).state && !std::isnan(stage) && stage > 0)
+              it.printf(0, 52, id(font_small), "Aux Heat: ON (stage %d)", (int) stage);
+            else
+              it.print(0, 52, id(font_small), id(aux_heat_on).state ? "Aux Heat: ON" : "Aux Heat: OFF");
+          }
+
+      - id: page_fault
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) status_text = "LINK DOWN";
+          else if (id(locked_out).state) status_text = "LOCK";
+          else status_text = id(current_mode).state;
+          it.print(0, 0, id(font_small), status_text.c_str());
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 : (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            else it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            float codef = id(last_fault_code).get_raw_state();
+            int code = std::isnan(codef) ? 0 : (int) codef;
+            std::string desc = id(fault_description).state;
+            std::string state_line;
+            if (id(locked_out).state) state_line = "LOCKOUT  Code:" + std::to_string(code);
+            else state_line = (code == 0) ? "OK - No Fault" : ("Last Fault:" + std::to_string(code));
+            it.print(0, 18, id(font_small), state_line.c_str());
+            // word-unaware wrap, ~20 chars/line, 3 lines
+            const size_t chars_per_line = 20;
+            for (int line = 0; line < 3; line++) {
+              size_t start = line * chars_per_line;
+              if (start >= desc.length()) break;
+              it.print(0, 29 + line * 11, id(font_small), desc.substr(start, chars_per_line).c_str());
+            }
+          }
+
+      - id: page_air
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) status_text = "LINK DOWN";
+          else if (id(locked_out).state) status_text = "LOCK";
+          else status_text = id(current_mode).state;
+          it.print(0, 0, id(font_small), status_text.c_str());
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 : (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            else it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            auto fmt = [](float v) -> std::string {
+              if (std::isnan(v)) return "N/A";
+              char buf[16]; snprintf(buf, sizeof(buf), "%.1fF", v); return std::string(buf);
+            };
+            float ecm = id(blower_ecm_speed).get_raw_state();
+            if (id(blower_on).state && !std::isnan(ecm))
+              it.printf(0, 18, id(font_small), "Blower: ON (ECM %d)", (int) ecm);
+            else
+              it.print(0, 18, id(font_small), id(blower_on).state ? "Blower: ON" : "Blower: OFF");
+            it.printf(0, 29, id(font_small), "Entering Air: %s", fmt(id(entering_air_temp).get_raw_state()).c_str());
+            it.printf(0, 40, id(font_small), "Leaving Air: %s", fmt(id(leaving_air_temp).get_raw_state()).c_str());
+          }
+
+      - id: page_water
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) status_text = "LINK DOWN";
+          else if (id(locked_out).state) status_text = "LOCK";
+          else status_text = id(current_mode).state;
+          it.print(0, 0, id(font_small), status_text.c_str());
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 : (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            else it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            it.printf(0, 18, id(font_small), "Water Flow: %.1f gpm", id(waterflow).get_raw_state());
+            it.printf(0, 29, id(font_small), "Entering: %.1fF", id(entering_water_temp).get_raw_state());
+            it.printf(0, 40, id(font_small), "Leaving: %.1fF", id(leaving_water_temp).get_raw_state());
+            it.printf(0, 51, id(font_small), "Delta-T: %.1fF", id(water_delta_t).get_raw_state());
+          }
+
+      - id: page_energy1
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) status_text = "LINK DOWN";
+          else if (id(locked_out).state) status_text = "LOCK";
+          else status_text = id(current_mode).state;
+          it.print(0, 0, id(font_small), status_text.c_str());
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 : (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            else it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            it.printf(0, 18, id(font_small), "Line Voltage: %.0fV", id(line_voltage).get_raw_state());
+            it.printf(0, 29, id(font_small), "Comp1: %.1fA  Comp2: %.1fA",
+                      id(compressor_1_amps).get_raw_state(), id(compressor_2_amps).get_raw_state());
+            it.printf(0, 40, id(font_small), "Blower: %.1fA", id(blower_amps).get_raw_state());
+            it.printf(0, 51, id(font_small), "Aux: %.1fA", id(aux_amps).get_raw_state());
+          }
+
+      - id: page_energy2
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) status_text = "LINK DOWN";
+          else if (id(locked_out).state) status_text = "LOCK";
+          else status_text = id(current_mode).state;
+          it.print(0, 0, id(font_small), status_text.c_str());
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 : (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            else it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            it.printf(0, 18, id(font_small), "Total: %.0fW", id(total_watts).get_raw_state());
+            it.printf(0, 29, id(font_small), "Comp: %.0fW  Blwr: %.0fW",
+                      id(compressor_watts).get_raw_state(), id(blower_watts).get_raw_state());
+            it.printf(0, 40, id(font_small), "Aux: %.0fW", id(aux_watts).get_raw_state());
+            it.printf(0, 51, id(font_small), "Open Loop: %.0fW", id(open_loop_watts).get_raw_state());
+          }
+
+      - id: page_efficiency
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) status_text = "LINK DOWN";
+          else if (id(locked_out).state) status_text = "LOCK";
+          else status_text = id(current_mode).state;
+          it.print(0, 0, id(font_small), status_text.c_str());
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 : (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            else it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else if (!id(compressor_running).state) {
+            // COP / heat transfer are only meaningful while the compressor runs
+            it.print(0, 20, id(font_main), "COP: --");
+            it.print(0, 46, id(font_small), "compressor idle");
+          } else {
+            float cop = id(cop).get_raw_state();
+            if (std::isnan(cop)) it.print(0, 18, id(font_main), "COP: --");
+            else it.printf(0, 18, id(font_main), "COP: %.2f", cop);
+            float hoe = id(heat_of_extraction).get_raw_state();
+            float hor = id(heat_of_rejection).get_raw_state();
+            if (!std::isnan(hoe) && hoe > 0)
+              it.printf(0, 40, id(font_small), "Extract: %.0f BTU/h", hoe);
+            else if (!std::isnan(hor) && hor > 0)
+              it.printf(0, 40, id(font_small), "Reject: %.0f BTU/h", hor);
+            it.printf(0, 51, id(font_small), "Approach: %.1fF", id(approach_temp).get_raw_state());
+          }
+
+      - id: page_diag
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) status_text = "LINK DOWN";
+          else if (id(locked_out).state) status_text = "LOCK";
+          else status_text = id(current_mode).state;
+          it.print(0, 0, id(font_small), status_text.c_str());
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 : (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            else it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          it.print(0, 18, id(font_small), "DIAGNOSTICS (upstream):");
+          it.printf(0, 29, id(font_small), "Poll: %s", "${update_interval}");
+          it.printf(0, 40, id(font_small), "WiFi: %.0f dBm", id(device_wifi_signal).state);
+          it.printf(0, 51, id(font_small), "Up: %.0fs  Addr: %s", id(device_uptime).state, "${modbus_address}");
