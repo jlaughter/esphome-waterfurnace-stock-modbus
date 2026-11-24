@@ -1,0 +1,137 @@
+# ESPHome WaterFurnace Aurora Monitor: Stock Modbus
+
+A read-only ESPHome monitor for WaterFurnace Aurora geothermal heat pumps. It uses
+**only standard Modbus function codes**, so it works on any Aurora ABC firmware,
+including boards too old for the full-featured WaterFurnace ESPHome components.
+
+It runs on an ESP32 with a MAX485 transceiver and an optional 128×64 OLED, and it
+exposes operating status, lockout and fault alerts, and live telemetry to Home
+Assistant, Hubitat, or anything else that speaks the ESPHome native API.
+
+## Which project should you use?
+
+| Your situation | Use |
+|---|---|
+| The full component never gets past setup and cycles **Idle → Link Down** forever | **This project** |
+| Your ABC board answers WaterFurnace's proprietary function codes 0x41/0x42 and you want everything (control, thermostat zones, refrigeration detail, DHW) | The full upstream component: [espforge/esphome-waterfurnace](https://github.com/espforge/esphome-waterfurnace) or [daemonp/esphome_waterfurnace_aurora](https://github.com/daemonp/esphome_waterfurnace_aurora) |
+| You only want monitoring and alerting and would rather not depend on proprietary function codes | Either one works. This project is deliberately smaller |
+
+### Why this exists
+
+The full components poll efficiently using WaterFurnace's proprietary function
+codes **0x41** (read ranges) and **0x42** (read scattered registers). An ABC
+board on firmware **v2.02** rejected every 0x42 request with exception `0xC2 / 01`
+("Illegal Function"), so the full component never finished setup.
+
+Standard **0x03 (Read Holding Registers)** worked fine. This config drops the
+custom component and uses only ESPHome's stock `modbus:` and `modbus_controller:`
+components, which only use standard function codes.
+
+**Tested on:** ABC v2.02 (the original reason this exists) and ABC v4.03 /
+AXB v4.01 after a firmware update. It works on both unchanged.
+
+## What it monitors
+
+- **Status:** compressor stage 1/2, aux heat stage 1/2, blower, a derived
+  "Current Mode" (Heating 1/2, Cooling 1/2, Aux Heat, Fan Only, Idle)
+- **Alerts:** live lockout flag, current fault code plus a human-readable
+  description (67-code table ported from upstream), system alarm, emergency
+  shutdown, RS-485 link health
+- **Diagnostics:** last lockout *event* code and description (a sticky history
+  register; see below), low/high pressure switch inputs
+- **Telemetry (AXB required):** blower ECM speed, line voltage, compressor and
+  blower amps, compressor/blower/aux/open-loop wattage, water flow,
+  entering/leaving water temp, entering/leaving air temp
+- **OLED:** six rotating pages (HVAC, Fault, Air, Water, two Energy pages) and
+  a diagnostics page that takes over automatically if the RS-485 link drops
+
+It is **strictly read-only**. There are no control entities, and it never
+writes to the heat pump.
+
+## Hardware
+
+- ESP32 dev board (classic ESP32-WROOM-32)
+- MAX485 RS-485 transceiver module, **powered from 3.3 V**
+- Optional: SSD1306 128×64 I2C OLED (the yellow/blue variant suits the header
+  layout)
+- A connection to the Aurora **AID tool port** for RS-485 A/B and ground
+
+### Wiring
+
+| MAX485 | ESP32 |
+|---|---|
+| RO | GPIO16 (RX2) |
+| DI | GPIO17 (TX2) |
+| DE + RE (tied together) | GPIO4 |
+| VCC | 3.3 V (**not 5 V**) |
+| GND | GND (common with the AID port reference) |
+| A / B | AID port A / B. Check polarity: if you get no responses, swap them |
+
+| OLED | ESP32 |
+|---|---|
+| SDA | GPIO21 |
+| SCL | GPIO22 |
+
+Power the ESP32 separately rather than from the AID port's 24 VAC. That keeps
+the AID port comms-only and means an HVAC power loss shows up as a link-down
+alert instead of the monitor going dark.
+
+Pins are set in the `substitutions:` block at the top of the YAML.
+
+## Install
+
+1. Copy `waterfurnace-monitor.yaml` into your ESPHome config directory.
+2. Provide `wifi_ssid` and `wifi_password` in your `secrets.yaml`.
+3. Check the `substitutions:` block (pins, Modbus address, poll interval).
+4. Build and flash as usual.
+
+## Things to check on your own install
+
+- **Water temperature sensors may be swapped.** On the reference unit the
+  entering/leaving water thermistors read backwards relative to the register
+  names. During a cooling call, *entering* water (from the loop) should be the
+  cooler of the two. If yours reads the other way, swap the addresses `1110`
+  and `1111` in the YAML. Upstream has a `water_temps_swapped` option for
+  exactly this reason.
+- **Entering air temp (register 567)** may not be populated without a
+  communicating thermostat. A raw 0 is reported as N/A, not 0°F.
+- **Leaving air** uses AXB register **1112**, not register 900, because
+  register 900 needs AWL AXB firmware.
+- **Pressure switch polarity** (whether 1 means tripped or normal) hasn't been
+  verified. Watch it during a normal run before you alert on it.
+- **"Last Lockout Event" is history, not live state.** Register 26 records the
+  most recent lockout and stays set after recovery. Use **System Locked Out**
+  (register 25, bit 15) for live alerting.
+- **Reversing valve:** RV energized means Cooling, regardless of the B/O DIP
+  switch. This matches upstream's logic and the AID tool on the reference unit.
+
+## Reporting cadence (why the filters are there)
+
+`modbus_controller` re-publishes every entity on every poll, even when nothing
+changed. That came to about 20 API pushes a minute, which is enough to bog down
+a Hubitat hub's ESPHome connection. Each numeric sensor therefore uses:
+
+```yaml
+filters:
+  - or:
+      - throttle: 300s   # slow heartbeat
+      - delta: 0.5       # real changes publish on the very next poll
+```
+
+The mode and fault text sensors only publish when their text changes, and
+binary sensors only publish on change by default. In steady state the traffic
+is a trickle, but compressor, aux and blower changes, temperature swings and
+fault codes still go out within one poll (60 s by default).
+
+## Credits
+
+All register addresses, data types, scaling and fault descriptions come from
+the upstream projects. This config only reads them in a different way:
+
+- [espforge/esphome-waterfurnace](https://github.com/espforge/esphome-waterfurnace)
+- [daemonp/esphome_waterfurnace_aurora](https://github.com/daemonp/esphome_waterfurnace_aurora),
+  which provided the register map (`registers.h`) and fault table (`registers.cpp`)
+
+## License
+
+MIT. See [LICENSE](LICENSE).

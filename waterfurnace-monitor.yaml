@@ -1,0 +1,1233 @@
+########################################################################
+# WaterFurnace Aurora Stock-Modbus Monitor
+# Repo: jlaughter/esphome-waterfurnace-stock-modbus
+#
+# WHY THIS EXISTS
+# ----------------
+# The full espforge/esphome-waterfurnace component relies on WaterFurnace's
+# proprietary Modbus function codes 0x41 (read ranges) and 0x42 (read
+# specific/scattered registers) for efficient polling. This system's ABC
+# board firmware (v2.02) does not implement 0x42 — every batch read comes
+# back as an exception (func 0xC2, code 0x01 "Illegal Function"), so the
+# component never gets past setup detection and the link cycles
+# Idle -> Link Down forever.
+#
+# Standard Modbus function 0x03 (Read Holding Registers) DOES work on this
+# firmware. This file abandons the custom component entirely and uses only
+# ESPHome's stock modbus: / modbus_controller: components, which only ever
+# use standard function codes (0x03 read holding, 0x06/0x10 write, etc).
+#
+# FIRMWARE UPDATE (Oct 2026): boards have since been updated to ABC v4.03 /
+# AXB v4.01. The stock-Modbus design was kept deliberately: it works, it's
+# firmware-agnostic, and a 60s poll doesn't need 0x41/0x42 batch reads. The
+# v2.02 notes above explain the original reason; they no longer describe
+# the current hardware.
+#
+# SCOPE (intentionally minimal — personal use, not a general integration)
+# -------------------------------------------------------------------
+#   - Basic operating status: compressor stage, aux heat, blower, mode
+#   - Lockout detection + last lockout fault code, for alerting
+#   - Fault code -> human-readable description (67-code table ported from
+#     upstream registers.cpp), exposed as text sensors for the OLED and
+#     for Hubitat/the ESPHome API to consume directly
+#   - Safety input flags (LPS/HPS/emergency shutdown) for diagnostics
+#   - Extended telemetry for the OLED: blower ECM speed, line voltage,
+#     compressor/blower amps, compressor/blower/aux/open-loop wattage,
+#     water flow + entering/leaving water temp, entering/leaving air temp.
+#     All read from the AXB block (confirmed installed on this system) or
+#     plain non-thermostat registers — see per-sensor comments below for the
+#     exact register chosen and why, especially for the two "leaving air"
+#     registers that exist (900 needs AWL, 1112 doesn't — this uses 1112).
+#   - NO control entities of any kind (read-only registers only)
+#   - NO communicating-thermostat registers (this install uses conventional
+#     T-stat wiring into the ABC; there's no AWL/IZ2 thermostat)
+#   - NO DHW support (installed but not connected on this system)
+#   - NO humidity sensor kit support (not installed)
+#   - NOT millisecond-accurate — a slow, polite poll is fine
+#
+# REGISTER MAP USED (from daemonp/esphome_waterfurnace_aurora registers.h,
+# confirmed as the canonical address list; these are standard function-0x03
+# holding register addresses, single contiguous block 25-31):
+#   25  LAST_FAULT           LIVE status register, confirmed against upstream
+#                            espforge/esphome-waterfurnace source
+#                            (publish_fault_sensors_() in waterfurnace_aurora.cpp):
+#                              bits 0-14 = current fault code (0 = no fault)
+#                              bit 15    = currently locked out (live, clears
+#                                          on its own when the system recovers)
+#                            This is what `locked_out` / `last_fault_code` /
+#                            `fault_description` and the OLED's "LOCK" header
+#                            all watch.
+#   26  LAST_LOCKOUT_FAULT   bits0-14 = the fault code from the most recent
+#                            lockout EVENT. Upstream reads this purely as a
+#                            "Lockout diagnostics" text field, never as a live
+#                            flag — it's a sticky "black box recorder" that
+#                            stays set after the system recovers and only
+#                            clears via an explicit CLEAR_FAULT_HISTORY write
+#                            (register 47, magic 0x5555), which this read-only
+#                            config never sends. Confirmed on this unit: reg26
+#                            showed a stale "High Pressure" lockout while both
+#                            the AID tool and register 25 agreed nothing was
+#                            actively locked. Exposed here as "Last Lockout
+#                            Event Code/Description" — historical context only.
+#   27  OUTPUTS_AT_LOCKOUT   system output bitmask captured at that same
+#                            historical lockout event (also sticky)
+#   28  INPUTS_AT_LOCKOUT    system status bitmask captured at that same
+#                            historical lockout event (also sticky)
+#   29  (unused/reserved — read but not mapped to any entity)
+#   30  SYSTEM_OUTPUTS       live output state, polled every cycle:
+#                            CC=0x01 CC2=0x02 RV=0x04 BLOWER=0x08 EH1=0x10
+#                            EH2=0x20 ACCESSORY=0x200 LOCKOUT=0x400 ALARM=0x800
+#                            Upstream's get_current_mode_string() also checks
+#                            this LOCKOUT bit (0x400) to show "Lockout" as the
+#                            mode string, so it's kept here as a secondary,
+#                            diagnostic-only cross-check of register 25 bit 15
+#                            — not the primary signal.
+#   31  SYSTEM_STATUS        Y1=0x01 Y2=0x02 W=0x04 O=0x08 G=0x10 DH_RH=0x20
+#                            EMERGENCY_SHUTDOWN=0x40 LPS=0x80 HPS=0x100
+#                            LOAD_SHED=0x200
+#
+# DIP SWITCH CONVENTION (confirmed from this unit's own dump_config):
+#   fp1=15 fp2=0 rv=B acc=0 stages=2 lockout=pulse dh_rh=reheat
+#   NOTE on RV polarity: registers.h documents B_TYPE/O_TYPE as a
+#   "energize to heat" / "energize to cool" DIP setting, which might suggest
+#   the OUTPUT_RV bit's meaning depends on that DIP switch. It doesn't.
+#   Checked upstream espforge/esphome-waterfurnace source directly —
+#   get_current_mode_string(), the subcool register selection, and the
+#   dehumidifier logic all use `(system_outputs_ & OUTPUT_RV) != 0` to mean
+#   Cooling, unconditionally, and none of them ever consult
+#   dip_switches_.reversing_valve to interpret it. So OUTPUT_RV=1 = Cooling
+#   is the correct universal reading of that register bit, independent of
+#   the B/O DIP setting (which apparently governs something else on the
+#   board, not how software should read this bit). Also confirmed live
+#   against the AID tool on this unit.
+#
+# HARDWARE WIRING (same physical build as the full OLED monitor project):
+#   MAX485 module <-> ESP32 (UART2):
+#     RO (pin1) -> ESP32 RX2 (GPIO16)
+#     DI (pin4) -> ESP32 TX2 (GPIO17)
+#     DE+RE (tied, flow control) -> GPIO4
+#     VCC -> 3.3V (NOT 5V)
+#     GND -> ESP32 GND (common ground with AID port reference)
+#     A/B -> AID tool port A/B (verified correct polarity; do not swap)
+#   ESP32 is powered separately from the AID port's 24VAC, so the AID
+#   port is comms-only and HVAC power loss is independently detectable.
+#   SSD1306 128x64 OLED (I2C): SDA -> GPIO21, SCL -> GPIO22
+########################################################################
+
+substitutions:
+  name: "waterfurnace-monitor"
+  friendly_name: "WaterFurnace Monitor"
+
+  uart_tx_pin: "GPIO17"
+  uart_rx_pin: "GPIO16"
+  flow_control_pin: "GPIO4"
+
+  modbus_address: "1"
+  # Governs both the RS-485 poll rate AND how often Hubitat's native-API
+  # subscription receives pushed state updates (each poll re-publishes,
+  # whether the value changed or not — modbus_controller doesn't dedupe
+  # before publish). 60s keeps RS-485 traffic polite and keeps Hubitat from
+  # getting a push every 10s across ~30 entities. The OLED still redraws
+  # every 1s (see display: update_interval below); it just shows the same
+  # data for up to a minute at a stretch, which is plenty for a system
+  # where compressor stage changes happen over minutes, not seconds.
+  update_interval_s: "60"
+  command_throttle_ms: "200"
+  com_offline_skip_updates: "3"   # how many missed polls before marked offline
+
+  wifi_bar_4_rssi: "-50"
+  wifi_bar_3_rssi: "-60"
+  wifi_bar_2_rssi: "-70"
+  wifi_bar_1_rssi: "-80"
+
+  page_rotation_interval_s: "5"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    then:
+      # modbus_controller's on_online only fires on an offline->online
+      # TRANSITION (see modbus_controller.cpp on_modbus_data()). Its internal
+      # module_offline_ flag starts false (optimistic), so if every poll
+      # succeeds from boot onward, that transition never happens and
+      # on_online never fires — com_ok would sit at its uninitialized
+      # default forever even though data is flowing fine. Set it optimistic
+      # here too, matching modbus_controller's own assumption; on_offline
+      # still correctly flips it false on a real timeout.
+      - binary_sensor.template.publish:
+          id: com_ok
+          state: true
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${name}"
+
+web_server:
+  port: 80
+  local: true
+  version: "2"
+
+########################################################################
+# Modbus — stock ESPHome components only, standard function codes only
+########################################################################
+
+uart:
+  id: aurora_uart
+  tx_pin: ${uart_tx_pin}
+  rx_pin: ${uart_rx_pin}
+  baud_rate: 19200
+  parity: EVEN
+  stop_bits: 1
+
+modbus:
+  id: modbus1
+  uart_id: aurora_uart
+  flow_control_pin: ${flow_control_pin}
+  turnaround_time: ${command_throttle_ms}ms   # was modbus_controller.command_throttle (no-op since 2026.x)
+
+modbus_controller:
+  - id: aurora
+    modbus_id: modbus1
+    address: ${modbus_address}
+    update_interval: ${update_interval_s}s
+    offline_skip_updates: ${com_offline_skip_updates}
+    setup_priority: -10
+    on_online:
+      - binary_sensor.template.publish:
+          id: com_ok
+          state: true
+    on_offline:
+      - binary_sensor.template.publish:
+          id: com_ok
+          state: false
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  frequency: 400kHz
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_main
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 10
+
+globals:
+  - id: page_rotation_index
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+switch:
+  - platform: template
+    id: show_diagnostics
+    name: "Show Signal Diagnostics"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: display_enabled
+    name: "Display Enabled"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - lambda: id(oled_display).turn_on();
+    on_turn_off:
+      - lambda: id(oled_display).turn_off();
+
+button:
+  # Stock ESPHome platform, needed for the Hubitat driver's reboot() command
+  - platform: restart
+    name: "Restart"
+
+interval:
+  - interval: ${page_rotation_interval_s}s
+    then:
+      - lambda: |-
+          if (!id(com_ok).state) {
+            id(oled_display).show_page(id(page_diag));
+            id(oled_display).update();
+            return;
+          }
+          if (id(show_diagnostics).state) {
+            id(oled_display).show_page(id(page_diag));
+            id(oled_display).update();
+            return;
+          }
+          // Normal round-robin — a lockout no longer forces/holds the fault
+          // page; it just takes its regular turn in the rotation like
+          // everything else. page_fault still shows LOCKOUT clearly with a
+          // "problem" device class when it comes around.
+          id(page_rotation_index) = (id(page_rotation_index) + 1) % 6;
+          switch (id(page_rotation_index)) {
+            case 0: id(oled_display).show_page(id(page_hvac)); break;
+            case 1: id(oled_display).show_page(id(page_fault)); break;
+            case 2: id(oled_display).show_page(id(page_air)); break;
+            case 3: id(oled_display).show_page(id(page_water)); break;
+            case 4: id(oled_display).show_page(id(page_energy1)); break;
+            case 5: id(oled_display).show_page(id(page_energy2)); break;
+          }
+          id(oled_display).update();
+
+########################################################################
+# Sensors — single contiguous read of holding registers 25-31.
+# ESPHome 2026.x removed register_count. The read is still one combined
+# command spanning 25..31: `reuse_previous_range: true` on the first
+# address-30 entity (system_output_lockout, binary_sensor section) bridges
+# the unused register-29 gap instead of starting a second request.
+########################################################################
+
+#
+# REPORTING CADENCE (hub chatter): modbus_controller re-publishes every entity
+# on every poll even when unchanged, which was ~20 API pushes/minute to
+# Hubitat. Numeric sensors below now use
+#   or: [throttle (slow heartbeat), delta (real changes go out immediately)]
+# so steady state is a trickle, but compressor/aux/blower changes, temp swings
+# and fault codes still publish on the very next poll. Binary sensors already
+# only publish on change. The OLED shows the same filtered values, so it can
+# lag sub-delta drift (e.g. <0.5F) by up to the throttle interval -- the
+# deltas are kept small so that's not visible in practice.
+########################################################################
+
+sensor:
+  - platform: uptime
+    id: device_uptime
+    name: "Uptime"
+    update_interval: 300s
+
+  - platform: wifi_signal
+    id: device_wifi_signal
+    name: "WiFi Signal"
+    update_interval: 300s
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: last_fault_code
+    name: "Last Fault Code"
+    register_type: holding
+    address: 25
+    value_type: U_WORD
+    bitmask: 0x7FFF         # bits 0-14 only; bit 15 is the live lockout flag below
+    entity_category: diagnostic
+    filters:
+      - or:
+          - throttle: 3600s
+          - delta: 0.5
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: lockout_fault_code
+    name: "Last Lockout Event Code"
+    register_type: holding
+    address: 26
+    value_type: U_WORD
+    bitmask: 0x7FFF
+    entity_category: diagnostic
+    # NOTE: register 26 is a sticky "black box recorder" of the most recent
+    # lockout event — it does NOT clear itself when the system recovers, only
+    # via an explicit CLEAR_FAULT_HISTORY write (register 47, magic 0x5555),
+    # which this read-only config never sends. Do not use this to mean
+    # "currently locked out" — see the `locked_out` binary_sensor below for
+    # the live flag.
+    filters:
+      - or:
+          - throttle: 3600s
+          - delta: 0.5
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: outputs_at_lockout
+    name: "Outputs At Lockout (raw)"
+    register_type: holding
+    address: 27
+    value_type: U_WORD
+    entity_category: diagnostic
+    internal: true    # raw diagnostic bitmask; enable if you want it exposed
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: inputs_at_lockout
+    name: "Inputs At Lockout (raw)"
+    register_type: holding
+    address: 28
+    value_type: U_WORD
+    entity_category: diagnostic
+    internal: true
+
+########################################################################
+# Extended telemetry — Air/Water/Energy pages. All confirmed against
+# upstream espforge/esphome-waterfurnace source (publish_power_loop_sensors_,
+# publish_compressor_drive_sensors_, publish_temperature_sensors_) for the
+# correct register, data type, and scaling. Each of these is its own
+# separate modbus range from the 25-31 block above (different address
+# neighborhoods) — a few extra short reads per poll cycle, still well within
+# "slow, polite poll" territory at the 60s interval.
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: blower_ecm_speed
+    name: "Blower ECM Speed"
+    register_type: holding
+    address: 344       # ECM_SPEED — matches the AID tool's 1-12 display directly, no scaling
+    value_type: U_WORD
+    filters:
+      - or:
+          - throttle: 600s
+          - delta: 0.5
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: line_voltage
+    name: "Line Voltage"
+    register_type: holding
+    address: 16        # LINE_VOLTAGE
+    value_type: U_WORD
+    unit_of_measurement: "V"
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 5.0
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: compressor_1_amps
+    name: "Compressor 1 Current"
+    register_type: holding
+    address: 1107      # AXB_COMPRESSOR1_AMPS — tenths of an amp
+    value_type: U_WORD
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - or:
+          - throttle: 300s
+          - delta: 1.0
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: compressor_2_amps
+    name: "Compressor 2 Current"
+    register_type: holding
+    address: 1108      # AXB_COMPRESSOR2_AMPS — tenths of an amp
+    value_type: U_WORD
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - or:
+          - throttle: 300s
+          - delta: 1.0
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: blower_amps
+    name: "Blower Current"
+    register_type: holding
+    address: 1105      # AXB_BLOWER_AMPS — tenths of an amp
+    value_type: U_WORD
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - or:
+          - throttle: 300s
+          - delta: 0.5
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: compressor_watts
+    name: "Compressor Wattage"
+    register_type: holding
+    address: 1146      # COMPRESSOR_WATTS — 32-bit, high word first, raw watts
+    value_type: U_DWORD
+    unit_of_measurement: "W"
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 100.0
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: blower_watts
+    name: "Blower Wattage"
+    register_type: holding
+    address: 1148      # BLOWER_WATTS — 32-bit, raw watts
+    value_type: U_DWORD
+    unit_of_measurement: "W"
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 50.0
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: aux_watts
+    name: "Aux Wattage"
+    register_type: holding
+    address: 1150      # AUX_WATTS — 32-bit, raw watts
+    value_type: U_DWORD
+    unit_of_measurement: "W"
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 500.0
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: open_loop_watts
+    name: "Open Loop Wattage"
+    register_type: holding
+    address: 1164      # PUMP_WATTS — 32-bit, raw watts (open loop/well pump)
+    value_type: U_DWORD
+    unit_of_measurement: "W"
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 100.0
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: waterflow
+    name: "Water Flow"
+    register_type: holding
+    address: 1117      # WATERFLOW — tenths of a GPM
+    value_type: U_WORD
+    unit_of_measurement: "gpm"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - or:
+          - throttle: 300s
+          - delta: 0.5
+
+  # Registers swapped relative to registers.h's plain ENTERING_WATER(1111)/
+  # LEAVING_WATER(1110) naming. Upstream documents a `water_temps_swapped_`
+  # override for exactly this: some installs have the thermistors on the
+  # physically opposite ports from what the register numbering assumes.
+  # Confirmed backwards on this unit by physics, not guesswork: during a
+  # verified cooling call (Current Mode: 'Cooling 1'), the unswapped mapping
+  # showed "Entering Water" at 91.6F and "Leaving Water" at 55.9F — but a
+  # cooling call REJECTS heat into the loop, so entering (from the ground)
+  # must be the cooler one and leaving (back to the ground) the warmer one.
+  # That's backwards, so the mapping below is swapped from the registers.h
+  # default to match physical reality on this system.
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: entering_water_temp
+    name: "Entering Water Temp"
+    register_type: holding
+    address: 1110      # LEAVING_WATER register number, but reads entering here — see comment above
+    value_type: S_WORD
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - or:
+          - throttle: 300s
+          - delta: 0.5
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: leaving_water_temp
+    name: "Leaving Water Temp"
+    register_type: holding
+    address: 1111      # ENTERING_WATER register number, but reads leaving here — see comment above
+    value_type: S_WORD
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - or:
+          - throttle: 300s
+          - delta: 0.5
+
+  # Entering air uses register 567 (ENTERING_AIR), the non-AWL register
+  # upstream falls back to when no communicating thermostat is present —
+  # this system doesn't have one. Upstream also treats a raw reading of
+  # exactly 0 as "sensor absent / not AWL-communicating" and suppresses it
+  # rather than publishing a literal 0°F, so this filter does the same.
+  # Untested on real hardware as of writing — if it just always reads N/A,
+  # that means this register isn't populated on this install either.
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: entering_air_temp
+    name: "Entering Air Temp"
+    register_type: holding
+    address: 567
+    value_type: S_WORD
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    filters:
+      - lambda: 'return (x == 0) ? NAN : x * 0.1;'
+      - or:
+          - throttle: 300s
+          - delta: 0.5
+
+  # Leaving air deliberately uses AXB_LEAVING_AIR_TEMP (1112), NOT the
+  # register named LEAVING_AIR (900) that registers.h lists — upstream
+  # explicitly documents register 900 as requiring AWL AXB firmware, which
+  # this system doesn't have (no fallback register exists for 900). 1112 is
+  # a different register, part of the plain AXB diagnostic block, gated
+  # only on AXB being installed (confirmed present on this system).
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: leaving_air_temp
+    name: "Leaving Air Temp"
+    register_type: holding
+    address: 1112
+    value_type: S_WORD
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+      - or:
+          - throttle: 300s
+          - delta: 0.5
+
+########################################################################
+# Binary sensors — decoded from register 25 (live lockout flag), 30
+# (outputs), 31 (status) bitmasks. All read-only.
+########################################################################
+
+binary_sensor:
+  - platform: template
+    id: com_ok
+    name: "RS-485 Link"
+    device_class: connectivity
+    # State is set imperatively by modbus_controller's on_online/on_offline
+    # automations above — this is the stock component's own liveness
+    # tracking, no custom heartbeat logic needed.
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: locked_out
+    name: "System Locked Out"
+    device_class: problem
+    register_type: holding
+    address: 25        # LAST_FAULT bit 15 — the live flag, confirmed against upstream
+    bitmask: 0x8000
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: system_output_lockout
+    name: "System Output Lockout (secondary)"
+    device_class: problem
+    register_type: holding
+    address: 30        # SYSTEM_OUTPUTS bit 0x400 — same bit upstream's
+    bitmask: 0x400     # get_current_mode_string() checks; kept as a
+    entity_category: diagnostic  # cross-check against `locked_out` above, not primary
+    reuse_previous_range: true   # bridge the reg-29 gap: keep 25..31 as one read
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: compressor_stage1
+    name: "Compressor Stage 1"
+    register_type: holding
+    address: 30
+    bitmask: 0x01
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: compressor_stage2
+    name: "Compressor Stage 2"
+    register_type: holding
+    address: 30
+    bitmask: 0x02
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: reversing_valve
+    name: "Reversing Valve Energized"
+    register_type: holding
+    address: 30
+    bitmask: 0x04
+    internal: true   # raw signal; mode text sensor below interprets it
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: blower_on
+    name: "Blower Running"
+    register_type: holding
+    address: 30
+    bitmask: 0x08
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: aux_heat_1
+    name: "Aux Heat Stage 1"
+    register_type: holding
+    address: 30
+    bitmask: 0x10
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: aux_heat_2
+    name: "Aux Heat Stage 2"
+    register_type: holding
+    address: 30
+    bitmask: 0x20
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: system_alarm
+    name: "System Alarm"
+    device_class: problem
+    register_type: holding
+    address: 30
+    bitmask: 0x800
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: low_pressure_switch
+    name: "Low Pressure Switch"
+    device_class: problem
+    register_type: holding
+    address: 31
+    bitmask: 0x80
+    entity_category: diagnostic
+    # Polarity (1=tripped vs 1=normal) not yet verified against a known-good
+    # run on this install — watch this during normal operation once and
+    # confirm before relying on it for alerting.
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: high_pressure_switch
+    name: "High Pressure Switch"
+    device_class: problem
+    register_type: holding
+    address: 31
+    bitmask: 0x100
+    entity_category: diagnostic
+    # Same polarity caveat as the low pressure switch above.
+
+  - platform: modbus_controller
+    modbus_controller_id: aurora
+    id: emergency_shutdown
+    name: "Emergency Shutdown"
+    device_class: problem
+    register_type: holding
+    address: 31
+    bitmask: 0x40
+
+########################################################################
+# Derived text — human-readable mode string from the output bits above.
+# RV-energized = Cooling — matches upstream's get_current_mode_string()
+# exactly (see header comment) and confirmed against the AID tool.
+########################################################################
+
+text_sensor:
+  - platform: template
+    id: current_mode
+    name: "Current Mode"
+    update_interval: ${update_interval_s}s
+    lambda: |-
+      // Only publish when the text actually changes -- this template
+      // re-evaluates every poll, and an identical string would otherwise
+      // be pushed to the hub each time. (Full state is still sent on
+      // every API reconnect.)
+      auto compute = [&]() -> std::string {
+        if (!id(com_ok).state) return {"Unknown"};
+        bool cc = id(compressor_stage1).state;
+        bool cc2 = id(compressor_stage2).state;
+        bool rv = id(reversing_valve).state;
+        bool eh1 = id(aux_heat_1).state;
+        bool eh2 = id(aux_heat_2).state;
+        bool blower = id(blower_on).state;
+
+        if (cc || cc2) {
+          std::string stage = cc2 ? "2" : "1";
+          std::string mode = rv ? "Cooling" : "Heating";
+          return {mode + " " + stage};
+        }
+        if (eh1 || eh2) {
+          return {"Aux Heat"};
+        }
+        if (blower) {
+          return {"Fan Only"};
+        }
+        return {"Idle"};
+      };
+      std::string s = compute();
+      if (id(current_mode).has_state() && s == id(current_mode).state) return {};
+      return s;
+
+  # Fault code -> text lookup, ported from daemonp/esphome_waterfurnace_aurora
+  # registers.cpp get_fault_description() (67-case table, upstream at
+  # https://github.com/daemonp/esphome_waterfurnace_aurora/blob/master/components/waterfurnace_aurora/registers.cpp).
+  # Duplicated across the two sensors below (last fault vs. lockout fault) to
+  # keep this a single self-contained YAML file with no external includes.
+  - platform: template
+    id: fault_description
+    name: "Last Fault Description"
+    update_interval: ${update_interval_s}s
+    lambda: |-
+      // Only publish when the text actually changes -- this template
+      // re-evaluates every poll, and an identical string would otherwise
+      // be pushed to the hub each time. (Full state is still sent on
+      // every API reconnect.)
+      auto compute = [&]() -> std::string {
+        if (!id(com_ok).state) return {"Unknown"};
+        uint16_t code = (uint16_t) id(last_fault_code).state;
+        switch (code) {
+          case 0: return {"No Fault"};
+          case 1: return {"Input Error"};
+          case 2: return {"High Pressure"};
+          case 3: return {"Low Pressure"};
+          case 4: return {"Freeze Detect FP2"};
+          case 5: return {"Freeze Detect FP1"};
+          case 7: return {"Condensate Overflow"};
+          case 8: return {"Over/Under Voltage"};
+          case 9: return {"AirF/RPM"};
+          case 10: return {"Compressor Monitor"};
+          case 11: return {"FP1/2 Sensor Error"};
+          case 12: return {"RefPerfrm Error"};
+          case 13: return {"Non-Critical AXB Sensor Error"};
+          case 14: return {"Critical AXB Sensor Error"};
+          case 15: return {"Hot Water Limit"};
+          case 16: return {"VS Pump Error"};
+          case 17: return {"Communicating Thermostat Error"};
+          case 18: return {"Non-Critical Communications Error"};
+          case 19: return {"Critical Communications Error"};
+          case 21: return {"Low Loop Pressure"};
+          case 22: return {"Communicating ECM Error"};
+          case 23: return {"HA Alarm 1"};
+          case 24: return {"HA Alarm 2"};
+          case 25: return {"AxbEev Error"};
+          case 41: return {"High Drive Temp"};
+          case 42: return {"High Discharge Temp"};
+          case 43: return {"Low Suction Pressure"};
+          case 44: return {"Low Condensing Pressure"};
+          case 45: return {"High Condensing Pressure"};
+          case 46: return {"Output Power Limit"};
+          case 47: return {"EEV ID Comm Error"};
+          case 48: return {"EEV OD Comm Error"};
+          case 49: return {"Cabinet Temperature Sensor"};
+          case 51: return {"Discharge Temp Sensor"};
+          case 52: return {"Suction Pressure Sensor"};
+          case 53: return {"Condensing Pressure Sensor"};
+          case 54: return {"Low Supply Voltage"};
+          case 55: return {"Out of Envelope"};
+          case 56: return {"Drive Over Current"};
+          case 57: return {"Drive Over/Under Voltage"};
+          case 58: return {"High Drive Temp"};
+          case 59: return {"Internal Drive Error"};
+          case 61: return {"Multiple Safe Mode"};
+          case 71: return {"Loss of Charge"};
+          case 72: return {"Suction Temperature Sensor"};
+          case 73: return {"Leaving Air Temperature Sensor"};
+          case 74: return {"Maximum Operating Pressure"};
+          case 99: return {"System Reset"};
+          default: return {"Unknown Fault"};
+        }
+      };
+      std::string s = compute();
+      if (id(fault_description).has_state() && s == id(fault_description).state) return {};
+      return s;
+
+  - platform: template
+    id: lockout_fault_description
+    name: "Last Lockout Event Description"
+    update_interval: ${update_interval_s}s
+    lambda: |-
+      // Only publish when the text actually changes -- this template
+      // re-evaluates every poll, and an identical string would otherwise
+      // be pushed to the hub each time. (Full state is still sent on
+      // every API reconnect.)
+      auto compute = [&]() -> std::string {
+        if (!id(com_ok).state) return {"Unknown"};
+        uint16_t code = (uint16_t) id(lockout_fault_code).state;
+        switch (code) {
+          case 0: return {"No Fault"};
+          case 1: return {"Input Error"};
+          case 2: return {"High Pressure"};
+          case 3: return {"Low Pressure"};
+          case 4: return {"Freeze Detect FP2"};
+          case 5: return {"Freeze Detect FP1"};
+          case 7: return {"Condensate Overflow"};
+          case 8: return {"Over/Under Voltage"};
+          case 9: return {"AirF/RPM"};
+          case 10: return {"Compressor Monitor"};
+          case 11: return {"FP1/2 Sensor Error"};
+          case 12: return {"RefPerfrm Error"};
+          case 13: return {"Non-Critical AXB Sensor Error"};
+          case 14: return {"Critical AXB Sensor Error"};
+          case 15: return {"Hot Water Limit"};
+          case 16: return {"VS Pump Error"};
+          case 17: return {"Communicating Thermostat Error"};
+          case 18: return {"Non-Critical Communications Error"};
+          case 19: return {"Critical Communications Error"};
+          case 21: return {"Low Loop Pressure"};
+          case 22: return {"Communicating ECM Error"};
+          case 23: return {"HA Alarm 1"};
+          case 24: return {"HA Alarm 2"};
+          case 25: return {"AxbEev Error"};
+          case 41: return {"High Drive Temp"};
+          case 42: return {"High Discharge Temp"};
+          case 43: return {"Low Suction Pressure"};
+          case 44: return {"Low Condensing Pressure"};
+          case 45: return {"High Condensing Pressure"};
+          case 46: return {"Output Power Limit"};
+          case 47: return {"EEV ID Comm Error"};
+          case 48: return {"EEV OD Comm Error"};
+          case 49: return {"Cabinet Temperature Sensor"};
+          case 51: return {"Discharge Temp Sensor"};
+          case 52: return {"Suction Pressure Sensor"};
+          case 53: return {"Condensing Pressure Sensor"};
+          case 54: return {"Low Supply Voltage"};
+          case 55: return {"Out of Envelope"};
+          case 56: return {"Drive Over Current"};
+          case 57: return {"Drive Over/Under Voltage"};
+          case 58: return {"High Drive Temp"};
+          case 59: return {"Internal Drive Error"};
+          case 61: return {"Multiple Safe Mode"};
+          case 71: return {"Loss of Charge"};
+          case 72: return {"Suction Temperature Sensor"};
+          case 73: return {"Leaving Air Temperature Sensor"};
+          case 74: return {"Maximum Operating Pressure"};
+          case 99: return {"System Reset"};
+          default: return {"Unknown Fault"};
+        }
+      };
+      std::string s = compute();
+      if (id(lockout_fault_description).has_state() && s == id(lockout_fault_description).state) return {};
+      return s;
+
+########################################################################
+# Display — 128x64 SSD1306, yellow top 16px used as a status header,
+# blue bottom 48px for page content. Six pages in normal rotation: HVAC,
+# Fault/Lockout, Air, Water, Energy 1 (voltage/amps), Energy 2 (wattage).
+# page_diag is not part of the rotation — it only shows on link-down or
+# when the "Show Signal Diagnostics" switch is on.
+########################################################################
+
+display:
+  - platform: ssd1306_i2c
+    id: oled_display
+    model: "SSD1306 128x64"
+    address: 0x3C
+    update_interval: 1s
+    pages:
+      - id: page_hvac
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) {
+            status_text = "LINK DOWN";
+          } else if (id(locked_out).state) {
+            status_text = "LOCK";
+          } else {
+            status_text = id(current_mode).state;
+          }
+          it.print(0, 0, id(font_small), status_text.c_str());
+
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 :
+                     (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 :
+                     (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) {
+              it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            } else {
+              it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            }
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+            it.print(0, 46, id(font_small), "waiting for link...");
+          } else {
+            it.printf(0, 18, id(font_main), "%s", id(current_mode).state.c_str());
+            std::string blower_txt;
+            if (id(blower_on).state) {
+              int ecm = (int) id(blower_ecm_speed).state;
+              blower_txt = "Blower: ON (ECM " + std::to_string(ecm) + ")";
+            } else {
+              blower_txt = "Blower: OFF";
+            }
+            it.print(0, 40, id(font_small), blower_txt.c_str());
+            std::string aux_txt = (id(aux_heat_1).state || id(aux_heat_2).state) ? "Aux Heat: ON" : "Aux Heat: OFF";
+            it.print(0, 52, id(font_small), aux_txt.c_str());
+          }
+
+      - id: page_fault
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) {
+            status_text = "LINK DOWN";
+          } else if (id(locked_out).state) {
+            status_text = "LOCK";
+          } else {
+            status_text = id(current_mode).state;
+          }
+          it.print(0, 0, id(font_small), status_text.c_str());
+
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 :
+                     (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 :
+                     (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) {
+              it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            } else {
+              it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            }
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            // register 25 (last_fault_code/fault_description) is the live,
+            // self-clearing pair — always synced with `locked_out`, since
+            // they come from the exact same register read. Register 26's
+            // "Last Lockout Event" fields are historical only and deliberately
+            // not used here; see header comment.
+            int code = (int) id(last_fault_code).state;
+            std::string desc = id(fault_description).state;
+            std::string state_line;
+            if (id(locked_out).state) {
+              state_line = "LOCKOUT  Code:" + std::to_string(code);
+            } else {
+              state_line = (code == 0) ? "OK - No Fault" : ("Last Fault:" + std::to_string(code));
+            }
+            it.print(0, 18, id(font_small), state_line.c_str());
+
+            // word-unaware wrap, ~20 chars/line, 3 lines
+            const size_t chars_per_line = 20;
+            for (int line = 0; line < 3; line++) {
+              size_t start = line * chars_per_line;
+              if (start >= desc.length()) break;
+              std::string chunk = desc.substr(start, chars_per_line);
+              it.print(0, 29 + line * 11, id(font_small), chunk.c_str());
+            }
+          }
+
+      - id: page_air
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) {
+            status_text = "LINK DOWN";
+          } else if (id(locked_out).state) {
+            status_text = "LOCK";
+          } else {
+            status_text = id(current_mode).state;
+          }
+          it.print(0, 0, id(font_small), status_text.c_str());
+
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 :
+                     (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 :
+                     (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) {
+              it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            } else {
+              it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            }
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            std::string blower_txt;
+            if (id(blower_on).state) {
+              int ecm = (int) id(blower_ecm_speed).state;
+              blower_txt = "Blower: ON (ECM " + std::to_string(ecm) + ")";
+            } else {
+              blower_txt = "Blower: OFF";
+            }
+            it.print(0, 18, id(font_small), blower_txt.c_str());
+
+            float entering = id(entering_air_temp).state;
+            if (std::isnan(entering)) {
+              it.print(0, 29, id(font_small), "Entering Air: N/A");
+            } else {
+              it.printf(0, 29, id(font_small), "Entering Air: %.1fF", entering);
+            }
+
+            float leaving = id(leaving_air_temp).state;
+            if (std::isnan(leaving)) {
+              it.print(0, 40, id(font_small), "Leaving Air: N/A");
+            } else {
+              it.printf(0, 40, id(font_small), "Leaving Air: %.1fF", leaving);
+            }
+          }
+
+      - id: page_water
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) {
+            status_text = "LINK DOWN";
+          } else if (id(locked_out).state) {
+            status_text = "LOCK";
+          } else {
+            status_text = id(current_mode).state;
+          }
+          it.print(0, 0, id(font_small), status_text.c_str());
+
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 :
+                     (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 :
+                     (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) {
+              it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            } else {
+              it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            }
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            it.printf(0, 18, id(font_small), "Water Flow: %.1f gpm", id(waterflow).state);
+            it.printf(0, 29, id(font_small), "Entering: %.1fF", id(entering_water_temp).state);
+            it.printf(0, 40, id(font_small), "Leaving: %.1fF", id(leaving_water_temp).state);
+          }
+
+      - id: page_energy1
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) {
+            status_text = "LINK DOWN";
+          } else if (id(locked_out).state) {
+            status_text = "LOCK";
+          } else {
+            status_text = id(current_mode).state;
+          }
+          it.print(0, 0, id(font_small), status_text.c_str());
+
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 :
+                     (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 :
+                     (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) {
+              it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            } else {
+              it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            }
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            it.printf(0, 18, id(font_small), "Line Voltage: %.0fV", id(line_voltage).state);
+            it.printf(0, 29, id(font_small), "Comp1: %.1fA", id(compressor_1_amps).state);
+            it.printf(0, 40, id(font_small), "Comp2: %.1fA", id(compressor_2_amps).state);
+            it.printf(0, 51, id(font_small), "Blower: %.1fA", id(blower_amps).state);
+          }
+
+      - id: page_energy2
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) {
+            status_text = "LINK DOWN";
+          } else if (id(locked_out).state) {
+            status_text = "LOCK";
+          } else {
+            status_text = id(current_mode).state;
+          }
+          it.print(0, 0, id(font_small), status_text.c_str());
+
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 :
+                     (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 :
+                     (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) {
+              it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            } else {
+              it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            }
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          if (!id(com_ok).state) {
+            it.print(0, 20, id(font_main), "-- -- --");
+          } else {
+            it.printf(0, 18, id(font_small), "Compressor: %.0fW", id(compressor_watts).state);
+            it.printf(0, 29, id(font_small), "Blower: %.0fW", id(blower_watts).state);
+            it.printf(0, 40, id(font_small), "Aux: %.0fW", id(aux_watts).state);
+            it.printf(0, 51, id(font_small), "Open Loop: %.0fW", id(open_loop_watts).state);
+          }
+
+      - id: page_diag
+        lambda: |-
+          // ---- shared header ----
+          std::string status_text;
+          if (!id(com_ok).state) {
+            status_text = "LINK DOWN";
+          } else if (id(locked_out).state) {
+            status_text = "LOCK";
+          } else {
+            status_text = id(current_mode).state;
+          }
+          it.print(0, 0, id(font_small), status_text.c_str());
+
+          int rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4 :
+                     (rssi >= ${wifi_bar_3_rssi}) ? 3 :
+                     (rssi >= ${wifi_bar_2_rssi}) ? 2 :
+                     (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          for (int i = 0; i < 4; i++) {
+            int bar_h = 3 + i * 3;
+            if (i < bars) {
+              it.filled_rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            } else {
+              it.rectangle(108 + i * 5, 16 - bar_h, 4, bar_h);
+            }
+          }
+          it.horizontal_line(0, 16, 128);
+
+          // ---- body ----
+          it.print(0, 18, id(font_small), "DIAGNOSTICS:");
+          it.printf(0, 29, id(font_small), "Poll: %ss", "${update_interval_s}");
+          it.printf(0, 40, id(font_small), "WiFi: %.0f dBm", id(device_wifi_signal).state);
+          it.printf(0, 51, id(font_small), "Up: %.0fs  Addr: %s", id(device_uptime).state, "${modbus_address}");
