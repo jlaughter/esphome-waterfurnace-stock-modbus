@@ -33,8 +33,9 @@ Upstream variant differences to be aware of:
 - There are no separate compressor **stage 1/2** entities. You get "Compressor
   Running" plus a mode string with no stage number. Stage still shows
   indirectly through blower ECM speed and compressor amps/watts.
-- Water thermistor swapping uses upstream's `water_temps_swapped: true`, which
-  also corrects the COP and approach math.
+- If you use a generic MAX485 module and setup never completes (request-echo
+  timeouts in the log), point `component_source` at the fork noted in the YAML
+  until espforge/esphome-waterfurnace#5 is merged.
 
 ### Why this exists
 
@@ -107,12 +108,14 @@ Pins are set in the `substitutions:` block at the top of the YAML.
 
 ## Things to check on your own install
 
-- **Water temperature sensors may be swapped.** On the reference unit the
-  entering/leaving water thermistors read backwards relative to the register
-  names. During a cooling call, *entering* water (from the loop) should be the
-  cooler of the two. If yours reads the other way, swap the addresses `1110`
-  and `1111` in the YAML. Upstream has a `water_temps_swapped` option for
-  exactly this reason.
+- **Water temperatures:** both YAMLs use the standard mapping (entering 1111,
+  leaving 1110). To check it, watch a *steady* heating cycle, about 10 minutes
+  in. Leaving water should be colder than entering, and
+  gpm × ΔT × 500 should roughly match Heat of Extraction. Don't trust the first
+  minute or two of a cycle: an early reading on the reference unit falsely
+  suggested the sensors were reversed. If they really are reversed on your
+  install, swap the two addresses in the stock YAML, or set
+  `water_temps_swapped: true` in the upstream YAML.
 - **Entering air temp (register 567)** may not be populated without a
   communicating thermostat. A raw 0 is reported as N/A, not 0°F.
 - **Leaving air** uses AXB register **1112**, not register 900, because
