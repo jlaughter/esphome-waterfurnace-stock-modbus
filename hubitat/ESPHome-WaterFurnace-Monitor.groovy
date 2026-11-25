@@ -192,6 +192,15 @@ metadata {
     wifi_signal          : ['WiFi Signal (dBm)', 'int', 'dBm'],
 ]
 
+/*
+ * Efficiency values only mean something while the compressor runs. Upstream
+ * publishes COP = 0 and Approach = NaN when idle, and NaN reaches Hubitat as a
+ * plain 0, so the driver clears these whenever Compressor Running is false.
+ */
+@groovy.transform.Field static final List<String> COMPRESSOR_GATED = [
+    'cop', 'approach_temp', 'heat_of_extraction', 'heat_of_rejection'
+]
+
 void installed() {
     log.info "${device} driver installed"
 }
@@ -400,9 +409,20 @@ void parseState(final Map message) {
     final Integer decimals = spec.size() > 3 ? spec[3] : null
     final Object raw = message.state
 
+    if (entityKey in COMPRESSOR_GATED && device.currentValue('Compressor Running') != 'true') {
+        if (device.currentValue(attr) != null) { device.deleteCurrentState(attr) }
+        return
+    }
+
     switch (type) {
         case 'bool':
             updateAttribute(attr, raw ? 'true' : 'false')
+            if (entityKey == 'compressor_running' && !raw) {
+                COMPRESSOR_GATED.each { String k ->
+                    final String gated = ENTITY_TABLE[k][0]
+                    if (device.currentValue(gated) != null) { device.deleteCurrentState(gated) }
+                }
+            }
             if (entityKey == 'locked_out' && raw) {
                 final String fault = device.currentValue('Last Fault Description') ?: 'unknown fault'
                 log.warn "WaterFurnace LOCKOUT: ${fault}"
