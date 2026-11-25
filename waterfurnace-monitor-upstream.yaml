@@ -57,6 +57,12 @@ substitutions:
 
   # Pin to a tag or commit (e.g. ...@<sha>) once you have a known-good build,
   # so an upstream change can't break your next compile.
+  #
+  # Generic MAX485 modules: if setup never completes and the log shows
+  # "Response timeout ... rx_buf=" starting with your own request bytes, your
+  # transceiver echoes requests back. Until espforge/esphome-waterfurnace#5 is
+  # merged, use the fork with the fix (this is what the reference unit runs):
+  #   github://jlaughter/esphome-waterfurnace@fix-rs485-echo-resync
   component_source: "github://espforge/esphome-waterfurnace@main"
 
   wifi_bar_4_rssi: "-50"
@@ -119,11 +125,12 @@ waterfurnace_aurora:
   address: ${modbus_address}
   update_interval: ${update_interval}
   flow_control_pin: ${flow_control_pin}
-  # This unit's entering/leaving water thermistors are on the physically
-  # opposite pipes from what the register names assume (confirmed during a
-  # cooling call -- see waterfurnace-monitor.yaml). Upstream's option fixes
-  # the labels AND the COP / approach-temperature math that depends on them.
-  water_temps_swapped: true
+  # Leave false unless your install's thermistors really are reversed. Check in
+  # steady heating: leaving water must be COLDER than entering, and COP should
+  # be ~3-5. On the reference unit an earlier `true` (based on one bad cooling
+  # reading) made COP read exactly 1.00, because it points COP at the
+  # heat-of-rejection register, which is zero while heating.
+  water_temps_swapped: false
   connected:
     id: com_ok
     name: "RS-485 Link"

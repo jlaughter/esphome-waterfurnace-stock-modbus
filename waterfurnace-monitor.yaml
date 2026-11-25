@@ -521,24 +521,21 @@ sensor:
           - throttle: 300s
           - delta: 0.5
 
-  # Registers swapped relative to registers.h's plain ENTERING_WATER(1111)/
-  # LEAVING_WATER(1110) naming. Upstream documents a `water_temps_swapped_`
-  # override for exactly this: some installs have the thermistors on the
-  # physically opposite ports from what the register numbering assumes.
-  # Confirmed backwards on this unit by physics, not guesswork: during a
-  # verified cooling call (Current Mode: 'Cooling 1'), the unswapped mapping
-  # showed "Entering Water" at 91.6F and "Leaving Water" at 55.9F — but a
-  # cooling call REJECTS heat into the loop, so entering (from the ground)
-  # must be the cooler one and leaving (back to the ground) the warmer one.
-  # That's backwards, so the mapping below is swapped from the registers.h
-  # default to match physical reality on this system.
+  # Standard registers.h mapping: ENTERING_WATER = 1111, LEAVING_WATER = 1110.
+  # An earlier version of this file swapped them, based on one cooling reading
+  # (91.6F "entering" vs 55.9F "leaving" -- a physically implausible 35F split,
+  # almost certainly a startup transient). Steady heating data on the reference
+  # unit proved the standard mapping correct: entering 67.1F, leaving 64.5F at
+  # 15.1 gpm, and 15.1 x 2.6F x 500 = 19,630 BTU/h exactly matches the board's
+  # own heat-of-extraction register. Sanity check for any install: in heating
+  # leaving water is COLDER than entering; in cooling it is WARMER.
 
   - platform: modbus_controller
     modbus_controller_id: aurora
     id: entering_water_temp
     name: "Entering Water Temp"
     register_type: holding
-    address: 1110      # LEAVING_WATER register number, but reads entering here — see comment above
+    address: 1111      # ENTERING_WATER
     value_type: S_WORD
     unit_of_measurement: "°F"
     accuracy_decimals: 1
@@ -553,7 +550,7 @@ sensor:
     id: leaving_water_temp
     name: "Leaving Water Temp"
     register_type: holding
-    address: 1111      # ENTERING_WATER register number, but reads leaving here — see comment above
+    address: 1110      # LEAVING_WATER
     value_type: S_WORD
     unit_of_measurement: "°F"
     accuracy_decimals: 1
