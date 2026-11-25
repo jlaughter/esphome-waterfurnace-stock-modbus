@@ -376,7 +376,7 @@ void cleanupStaleAttributes() {
 }
 
 void parseState(final Map message) {
-    if (message.key == null || message.hasState == false) { return }
+    if (message.key == null) { return }
     final long key = message.key as long
 
     final String entityKey = (state.entities ?: [:]).find { k, v -> (v as long) == key }?.key
@@ -385,6 +385,16 @@ void parseState(final Map message) {
     if (!spec) { return }
 
     final String attr = spec[0]
+    if (message.hasState == false) {
+        // Entity exists but has no valid reading (e.g. upstream's Entering Air
+        // Temp, suppressed without a communicating thermostat, or Approach
+        // Temperature with the compressor off): clear rather than leave a stale value.
+        if (device.currentValue(attr) != null) {
+            device.deleteCurrentState(attr)
+            if (logEnable) { log.debug "${device}: cleared '${attr}' (no valid reading)" }
+        }
+        return
+    }
     final String type = spec[1]
     final String unit = spec.size() > 2 ? spec[2] : null
     final Integer decimals = spec.size() > 3 ? spec[3] : null
