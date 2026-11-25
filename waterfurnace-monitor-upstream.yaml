@@ -27,9 +27,6 @@
 #     "Heating + Aux", "Emergency Heat", "Fan Only", "Waiting", "Standby",
 #     "Lockout"), with no stage number. Stage is still visible
 #     indirectly through blower ECM speed and compressor amps/watts.
-#   - Pressure switches use upstream's polarity: "problem" = switch OPEN
-#     (status bit clear). The stock variant reads the raw bit, which is the
-#     opposite polarity.
 #
 # STRICTLY READ-ONLY, BY CONSTRUCTION
 #   The upstream package also provides climate, water_heater, switch,
@@ -705,9 +702,11 @@ display:
             it.print(0, 20, id(font_main), "COP: --");
             it.print(0, 46, id(font_small), "compressor idle");
           } else {
-            float cop = id(cop).get_raw_state();
-            if (std::isnan(cop)) it.print(0, 18, id(font_main), "COP: --");
-            else it.printf(0, 18, id(font_main), "COP: %.2f", cop);
+            // (local must not be named "cop": id(cop) expands to the global
+            // sensor pointer named cop, which the local would shadow)
+            float cop_val = id(cop).get_raw_state();
+            if (std::isnan(cop_val)) it.print(0, 18, id(font_main), "COP: --");
+            else it.printf(0, 18, id(font_main), "COP: %.2f", cop_val);
             float hoe = id(heat_of_extraction).get_raw_state();
             float hor = id(heat_of_rejection).get_raw_state();
             if (!std::isnan(hoe) && hoe > 0)

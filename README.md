@@ -35,7 +35,6 @@ Upstream variant differences to be aware of:
   indirectly through blower ECM speed and compressor amps/watts.
 - Water thermistor swapping uses upstream's `water_temps_swapped: true`, which
   also corrects the COP and approach math.
-- Pressure switches use upstream's polarity: *problem* means the switch is open.
 
 ### Why this exists
 
@@ -118,8 +117,10 @@ Pins are set in the `substitutions:` block at the top of the YAML.
   communicating thermostat. A raw 0 is reported as N/A, not 0°F.
 - **Leaving air** uses AXB register **1112**, not register 900, because
   register 900 needs AWL AXB firmware.
-- **Pressure switch polarity** (whether 1 means tripped or normal) hasn't been
-  verified. Watch it during a normal run before you alert on it.
+- **Pressure switch polarity:** the status bits are set when the switch is
+  *closed*, which is normal. The YAML inverts them, so `true` means tripped and
+  they're safe to alert on. This was verified on the reference unit and matches
+  upstream.
 - **"Last Lockout Event" is history, not live state.** Register 26 records the
   most recent lockout and stays set after recovery. Use **System Locked Out**
   (register 25, bit 15) for live alerting.
