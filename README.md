@@ -21,7 +21,7 @@ Assistant, Hubitat, or anything else that speaks the ESPHome native API.
 | File | Needs | Notes |
 |---|---|---|
 | `waterfurnace-monitor.yaml` | Any ABC firmware | **Stock Modbus.** Only standard function codes; the original reason this repo exists |
-| `waterfurnace-monitor-upstream.yaml` | ABC firmware that answers 0x41/0x42 (e.g. v4.x) | **Upstream component**, kept read-only. Adds hardware auto-detection, COP, water delta-T, approach temp, heat of extraction/rejection, total watts, aux amps, fault history, model/serial. **Experimental**: under evaluation on the reference unit |
+| `waterfurnace-monitor-upstream.yaml` | ABC firmware that answers 0x41/0x42 (e.g. v4.x) | **Upstream component**, kept read-only. Adds hardware auto-detection, COP, water delta-T, heat of extraction/rejection, total watts, aux amps, fault history, model/serial. **Experimental**: under evaluation on the reference unit |
 
 Both variants use the same hardware, pins, OLED layout and Hubitat-friendly
 reporting filters, so you can swap between them by reflashing. The upstream
@@ -116,6 +116,13 @@ Pins are set in the `substitutions:` block at the top of the YAML.
   suggested the sensors were reversed. If they really are reversed on your
   install, swap the two addresses in the stock YAML, or set
   `water_temps_swapped: true` in the upstream YAML.
+- **Approach temperature is deliberately left out** of the upstream build. In
+  heating, upstream calculates it as saturated condenser temp (register 1134)
+  minus leaving air. On the reference unit (no VS drive, no refrigerant pressure
+  sensors), register 1134 read 100.3°F against 104.3°F leaving air, which is
+  physically impossible for a condenser, so the result was always negative.
+  Add `approach_temperature:` back only if your unit has a VS drive or
+  refrigeration monitoring.
 - **Entering air temp (register 567)** may not be populated without a
   communicating thermostat. A raw 0 is reported as N/A, not 0°F.
 - **Leaving air** uses AXB register **1112**, not register 900, because
@@ -171,8 +178,8 @@ installed on the hub.
 - After each entity discovery, the driver removes any attribute the current
   build doesn't publish. Switching from stock to upstream drops the
   Compressor/Aux Stage 1/2 attributes instead of leaving them frozen.
-- Readings with no valid value (e.g. Approach Temperature while the compressor
-  is off) clear the attribute instead of showing a stale number.
+- Readings with no valid value (e.g. upstream's Entering Air Temp without a
+  communicating thermostat) clear the attribute instead of showing a stale number.
 - The only command is `reboot()`, which uses the YAML's restart button.
 
 To install, add it under **Drivers Code** (or import from the raw GitHub URL),

@@ -12,8 +12,8 @@
 # WHAT YOU GAIN OVER THE STOCK-MODBUS VARIANT
 #   - Hardware auto-detection (AXB, VS drive, IZ2, blower type, pump type,
 #     energy monitor level): registers your hardware lacks are skipped
-#   - Derived efficiency metrics: COP, water delta-T, approach temperature,
-#     heat of extraction/rejection
+#   - Derived efficiency metrics: COP, water delta-T, heat of
+#     extraction/rejection
 #   - Total system watts, aux amps, aux heat stage, anti-short-cycle timer
 #   - Fault history (last 10), model/serial number, hardware summary
 #   - Upstream-maintained register map and scaling, plus adaptive
@@ -294,13 +294,6 @@ sensor:
     water_delta_t:
       id: water_delta_t
       name: "Water Delta-T"
-      filters:
-        - or:
-            - throttle: 300s
-            - delta: 0.5
-    approach_temperature:
-      id: approach_temp
-      name: "Approach Temperature"
       filters:
         - or:
             - throttle: 300s
@@ -720,7 +713,7 @@ display:
               it.printf(0, 40, id(font_small), "Extract: %.0f BTU/h", hoe);
             else if (!std::isnan(hor) && hor > 0)
               it.printf(0, 40, id(font_small), "Reject: %.0f BTU/h", hor);
-            it.printf(0, 51, id(font_small), "Approach: %.1fF", id(approach_temp).get_raw_state());
+            it.printf(0, 51, id(font_small), "Water dT: %.1fF", id(water_delta_t).get_raw_state());
           }
 
       - id: page_diag
