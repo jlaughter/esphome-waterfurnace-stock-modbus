@@ -155,6 +155,26 @@ binary sensors only publish on change by default. In steady state the traffic
 is a trickle, but compressor, aux and blower changes, temperature swings and
 fault codes still go out within one poll (60 s by default).
 
+## Hubitat driver
+
+`hubitat/ESPHome-WaterFurnace-Monitor.groovy` is a read-only Hubitat driver
+that works with **both** variants. It's built on Jonathan Bradshaw's ESPHome
+Native API library (`esphome.espHomeApiHelper`), which must already be
+installed on the hub.
+
+- Attributes that both builds share have the same names, so rules keep working
+  after a reflash in either direction.
+- After each entity discovery, the driver removes any attribute the current
+  build doesn't publish. Switching from stock to upstream drops the
+  Compressor/Aux Stage 1/2 attributes instead of leaving them frozen.
+- Readings with no valid value (e.g. Approach Temperature while the compressor
+  is off) clear the attribute instead of showing a stale number.
+- The only command is `reboot()`, which uses the YAML's restart button.
+
+To install, add it under **Drivers Code** (or import from the raw GitHub URL),
+create a virtual device or switch an existing one to type
+**ESPHome WaterFurnace Monitor**, set the device's IP address, and save.
+
 ## Credits
 
 All register addresses, data types, scaling and fault descriptions come from
